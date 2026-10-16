@@ -1,5 +1,5 @@
 # 🌋 Project Flow
-Want to play again on chapter 1 season 8 ? Or did you never played and want today? Now you can easly with **Project Flow** \
+Want to play again on chapter 1 season 8 ? Or did you never played and want today? Now you can easly with **[Project Flow](https://discord.gg/rD9hFZtFW)** \
 *(It's 100% safe if you don't believe us just don't download)*
 
 # 🚀 Quick Installation
