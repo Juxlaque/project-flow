@@ -4,4 +4,4 @@ Want to play again on chapter 1 season 8 ? Or did you never played and want toda
 
 # 🚀 Quick Installation
 Download Project Flow from [releases](https://github.com/Juxlaque/project-flow/releases) or our [Discord server](https://discord.gg/rD9hFZtFW). \
-Launch the app, download **(DEPEND OF YOU'R CONNEXION)** and play with bots! \
+Launch the app, download **(DEPEND OF YOU'R CONNEXION)** and play with **bots**!
