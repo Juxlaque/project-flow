@@ -1,0 +1,1477 @@
+#pragma once
+
+#include <cmath>
+#include <deque>
+#include <malloc.h>
+#include "FortGameModeAthena.h"
+#include "OnlineReplStructs.h"
+#include "BuildingContainer.h"
+#include "botnames.h"
+
+extern bool bStartedBus;
+
+class PlayerBot;
+inline std::vector<PlayerBot*> AllPlayerBotsToTick;
+inline bool bAircraftEnteredDropZone = false;
+inline float AircraftDropZoneEnterTime = 0.f;
+inline float NextTickLogTime = 0.f;
+
+enum class EBotState : uint8_t
+{
+    Waiting,
+    Bus,
+    Freefall,
+    Gliding,
+    Roaming
+};
+
+class PlayerBot
+{
+public:
+    static inline UClass* PawnClass = nullptr;
+    static inline UClass* ControllerClass = nullptr;
+
+    AController* Controller = nullptr;
+    bool bIsAthenaController = false;
+    AFortPlayerPawnAthena* Pawn = nullptr;
+    AFortPlayerStateAthena* PlayerState = nullptr;
+
+    EBotState State = EBotState::Waiting;
+    float JumpFromBusTime = 0.f;
+    float GliderTime = 0.f;
+    float NextMoveTargetTime = 0.f;
+    float NextStuckCheckTime = 0.f;
+    float NextJumpTime = 0.f;
+    float LandedTime = 0.f;
+    float NextLogTime = 0.f;
+    float LastUpdateTime = 0.f;
+    float EstimatedGroundZ = 1500.f;
+    FVector TargetLocation = FVector();
+    FVector LastPosition = FVector();
+    bool bDamageRestored = false;
+    bool bGliderRequested = false;
+    bool bShouldThankBusDriver = false;
+    bool bThankedBusDriver = false;
+    float ThankBusDriverTime = 0.f;
+
+    static bool ShouldUseAIBotController()
+    {
+        return false;
+    }
+
+    static void InitializeBotClasses()
+    {
+        PawnClass = FindObject<UClass>(L"/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C");
+        ControllerClass = AFortPlayerControllerAthena::StaticClass();
+
+        if (!PawnClass)
+        {
+            LOG_ERROR(LogBots, "Failed to find a class for the bots!");
+        }
+    }
+
+    static void ProbeAircraftFields()
+    {
+        static bool bDone = false;
+        if (bDone) return;
+        bDone = true;
+
+        static auto FortAthenaAircraftClass = FindObject<UClass>(L"/Script/FortniteGame.FortAthenaAircraft");
+        if (!FortAthenaAircraftClass)
+        {
+            LOG_ERROR(LogBots, "Probe: FortAthenaAircraft class introuvable!");
+            return;
+        }
+
+        // Noms plausibles vus dans divers dumps de FortAthenaAircraft selon les saisons.
+        const char* Candidates[] = {
+            "Passengers", "AircraftPassengers", "PlayersOnAircraft",
+            "PassengerControllers", "OccupyingControllers", "PlayersInAircraft",
+            "NumPassengers", "NumPlayersAboard", "RemainingPassengerCount",
+            "SkydiversRemaining", "bAllPassengersJumped", "JumpedPlayers",
+            "PlayersJumped", "OccupantList", "Occupants"
+        };
+
+        for (auto Name : Candidates)
+        {
+            auto Off = FortAthenaAircraftClass->GetOffset(Name, false);
+            LOG_INFO(LogBots, "Probe FortAthenaAircraft::{} -> offset {}", Name, Off);
+        }
+
+        // Idem côté GameState, au cas où le comptage vive là plutôt que sur l'acteur.
+        static auto GameStateAthenaClass = FindObject<UClass>(L"/Script/FortniteGame.FortGameStateAthena");
+        const char* GSCandidates[] = {
+            "PlayersInAircraftCount", "NumPlayersInAircraft", "RemainingAircraftPlayers",
+            "bGameModeWillSkipAircraft" // juste pour vérifier que le offset existe bien, sanity check
+        };
+        for (auto Name : GSCandidates)
+        {
+            auto Off = GameStateAthenaClass->GetOffset(Name, false);
+            LOG_INFO(LogBots, "Probe FortGameStateAthena::{} -> offset {}", Name, Off);
+        }
+    }
+
+    static bool IsReadyToSpawnBot()
+    {
+        if (!PawnClass || !ControllerClass)
+        {
+            InitializeBotClasses();
+        }
+        return PawnClass != nullptr && ControllerClass != nullptr;
+    }
+
+    void SetupInventory()
+    {
+        auto GameMode = Cast<AFortGameModeAthena>(GetWorld()->GetGameMode());
+        if (!GameMode)
+        {
+            LOG_ERROR(LogBots, "No GameMode when setting up bot inventory!");
+            Pawn->K2_DestroyActor();
+            Controller->K2_DestroyActor();
+            return;
+        }
+
+        AFortInventory** Inventory = nullptr;
+
+        if (auto FortPlayerController = Cast<AFortPlayerController>(Controller))
+        {
+            Inventory = &FortPlayerController->GetWorldInventory();
+        }
+
+        if (!Inventory)
+        {
+            LOG_ERROR(LogBots, "No inventory pointer!");
+            Pawn->K2_DestroyActor();
+            Controller->K2_DestroyActor();
+            return;
+        }
+
+        static auto FortInventoryClass = FindObject<UClass>(L"/Script/FortniteGame.FortInventory");
+        *Inventory = GetWorld()->SpawnActor<AFortInventory>(FortInventoryClass, FTransform{}, CreateSpawnParameters(ESpawnActorCollisionHandlingMethod::AlwaysSpawn, false, Controller));
+
+        if (!*Inventory)
+        {
+            LOG_ERROR(LogBots, "Failed to spawn Inventory!");
+            Pawn->K2_DestroyActor();
+            Controller->K2_DestroyActor();
+            return;
+        }
+
+        (*Inventory)->GetInventoryType() = EFortInventoryType::World;
+
+        if (auto FortPlayerController = Cast<AFortPlayerController>(Controller))
+        {
+            static auto bHasInitializedWorldInventoryOffset = FortPlayerController->GetOffset("bHasInitializedWorldInventory");
+            FortPlayerController->Get<bool>(bHasInitializedWorldInventoryOffset) = true;
+        }
+
+        auto& StartingItems = GameMode->GetStartingItems();
+
+        for (int i = 0; i < StartingItems.Num(); ++i)
+        {
+            auto& StartingItem = StartingItems.at(i);
+            (*Inventory)->AddItem(StartingItem.GetItem(), nullptr, StartingItem.GetCount());
+        }
+
+        if (auto FortPlayerController = Cast<AFortPlayerController>(Controller))
+        {
+            UFortItem* PickaxeInstance = FortPlayerController->AddPickaxeToInventory();
+
+            if (PickaxeInstance)
+            {
+                FortPlayerController->ServerExecuteInventoryItemHook(FortPlayerController, PickaxeInstance->GetItemEntry()->GetItemGuid());
+            }
+        }
+
+        (*Inventory)->Update();
+    }
+
+    void PickRandomLoadout()
+    {
+        static std::vector<UFortItemDefinition*> CachedAthenaHeroTypes;
+        static bool bHeroTypesCached = false;
+
+        if (!bHeroTypesCached)
+        {
+            auto HeroTypeClass = FindObject<UClass>(L"/Script/FortniteGame.FortHeroType");
+            if (HeroTypeClass)
+            {
+                auto AllHeroTypes = GetAllObjectsOfClass(HeroTypeClass);
+                for (size_t i = 0; i < AllHeroTypes.size(); ++i)
+                {
+                    auto CurrentHeroType = (UFortItemDefinition*)AllHeroTypes.at(i);
+                    if (CurrentHeroType && CurrentHeroType->GetPathName().starts_with("/Game/Athena/Heroes/"))
+                    {
+                        CachedAthenaHeroTypes.push_back(CurrentHeroType);
+                    }
+                }
+            }
+            bHeroTypesCached = true;
+            LOG_INFO(LogBots, "Cached {} Athena Hero Types for bots.", CachedAthenaHeroTypes.size());
+        }
+
+        UFortItemDefinition* HeroType = FindObject<UFortItemDefinition>(L"/Game/Athena/Heroes/HID_030_Athena_Commando_M_Halloween.HID_030_Athena_Commando_M_Halloween");
+        if (!CachedAthenaHeroTypes.empty())
+        {
+            HeroType = CachedAthenaHeroTypes.at(std::rand() % CachedAthenaHeroTypes.size());
+        }
+
+        if (PlayerState)
+        {
+            static auto HeroTypeOffset = PlayerState->GetOffset("HeroType");
+            if (HeroTypeOffset != -1)
+                PlayerState->Get(HeroTypeOffset) = HeroType;
+        }
+    }
+
+    void ApplyCosmeticLoadout()
+    {
+        if (!PlayerState)
+            return;
+
+        auto BotPawn = Cast<AFortPlayerPawn>(Pawn);
+
+        if (!BotPawn)
+            return;
+
+        static auto HeroTypeOffset = PlayerState->GetOffset("HeroType", false);
+
+        if (HeroTypeOffset == -1)
+            return;
+
+        UObject* CurrentHeroType = PlayerState->Get(HeroTypeOffset);
+
+        if (!CurrentHeroType)
+            return;
+
+        // Go through the game's own ServerChoosePart path (ApplyHID with
+        // bUseServerChoosePart set) instead of poking PlayerState::CharacterParts
+        // by hand. A hand-written CharacterParts array leaves the pawn with no
+        // parts of its own and its cosmetic loadout flag clear, so every client
+        // spams "GetPawnCosmeticLoadout() called before it has been initialized"
+        // for each bot and then faults on a null part while building the
+        // character mesh (EXCEPTION_ACCESS_VIOLATION reading 0x0).
+        ApplyHID(BotPawn, CurrentHeroType, true);
+
+        PlayerState->ForceNetUpdate();
+        BotPawn->ForceNetUpdate();
+    }
+
+    static inline std::deque<std::wstring> BotNamesStorage;
+
+    static FString GetRandomName()
+    {
+        if (PlayerBotNames.empty())
+        {
+            InitBotNames();
+        }
+
+        static int ExtraNum = 1;
+        std::wstring ChosenName;
+
+        if (!PlayerBotNames.empty())
+        {
+            int RandomIndex = std::rand() % PlayerBotNames.size();
+            ChosenName = PlayerBotNames[RandomIndex];
+            PlayerBotNames.erase(PlayerBotNames.begin() + RandomIndex);
+        }
+        else
+        {
+            ChosenName = L"Bot" + std::to_wstring(ExtraNum++);
+        }
+
+        BotNamesStorage.push_back(ChosenName);
+        return FString(BotNamesStorage.back().c_str());
+    }
+
+    void SetName(const FString& NewName)
+    {
+        auto GameMode = Cast<AFortGameModeAthena>(GetWorld()->GetGameMode());
+        if (GameMode)
+            GameMode->ChangeName(Controller, NewName, true);
+
+        if (PlayerState)
+            PlayerState->ForceNetUpdate();
+    }
+
+    void TryThankBusDriver(float CurrentTime)
+    {
+        if (!bShouldThankBusDriver || bThankedBusDriver || CurrentTime < ThankBusDriverTime)
+            return;
+
+        if (!PlayerState)
+            return;
+
+        static auto bThankedBusDriverOffset = PlayerState->GetOffset("bThankedBusDriver", false);
+        if (bThankedBusDriverOffset != -1)
+        {
+            static auto bThankedBusDriverProp = PlayerState->GetProperty("bThankedBusDriver", false);
+            if (bThankedBusDriverProp)
+            {
+                static auto bThankedBusDriverFieldMask = GetFieldMask(bThankedBusDriverProp);
+                if (bThankedBusDriverFieldMask != 255)
+                {
+                    PlayerState->SetBitfieldValue(bThankedBusDriverOffset, bThankedBusDriverFieldMask, true);
+                    
+                static auto OnRep_ThankedBusDriverFn = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerStateAthena.OnRep_ThankedBusDriver");
+                if (OnRep_ThankedBusDriverFn)
+                    PlayerState->ProcessEvent(OnRep_ThankedBusDriverFn);
+
+                bThankedBusDriver = true;
+                LOG_INFO(LogBots, "Bot {} thanked the bus driver!", PlayerState->GetPlayerName().ToString());
+                }
+            }
+        }
+    }
+
+    float Now()
+    {
+        return UGameplayStatics::GetTimeSeconds(GetWorld());
+    }
+
+    float RandRange(float Min, float Max)
+    {
+        return Min + (float(std::rand()) / float(RAND_MAX)) * (Max - Min);
+    }
+
+    UObject* GetMovementComponent()
+    {
+        if (!Pawn)
+            return nullptr;
+
+        static auto CharacterMovementOffset = Pawn->GetOffset("CharacterMovement");
+        return Pawn->Get(CharacterMovementOffset);
+    }
+
+    int GetMovementMode()
+    {
+        auto Movement = GetMovementComponent();
+
+        if (!Movement)
+            return -1;
+
+        static auto MovementModeOffset = Movement->GetOffset("MovementMode");
+        return (int)Movement->Get<uint8_t>(MovementModeOffset);
+    }
+
+    void SetMovementMode(uint8_t Mode)
+    {
+        auto Movement = GetMovementComponent();
+
+        if (!Movement)
+            return;
+
+        static auto SetMovementModeFn = FindObject<UFunction>(L"/Script/Engine.CharacterMovementComponent.SetMovementMode");
+
+        if (SetMovementModeFn)
+        {
+            struct
+            {
+                uint8_t NewMovementMode;
+                uint8_t NewCustomMode;
+            } Params{ Mode, 0 };
+
+            Movement->ProcessEvent(SetMovementModeFn, &Params);
+            return;
+        }
+
+        static auto MovementModeOffset = Movement->GetOffset("MovementMode");
+        Movement->Get<uint8_t>(MovementModeOffset) = Mode;
+    }
+
+    bool IsOnGround()
+    {
+        return GetMovementMode() == 1;
+    }
+
+    void SetInvulnerable(bool bValue)
+    {
+        if (!Pawn)
+            return;
+
+        Pawn->SetCanBeDamaged(!bValue);
+
+        if (bValue)
+        {
+            Pawn->SetMaxHealth(100);
+            Pawn->SetHealth(100);
+        }
+    }
+
+    void AddMovement(const FVector& Direction, float Scale)
+    {
+        static auto AddMovementInputFn = FindObject<UFunction>(L"/Script/Engine.Pawn.AddMovementInput");
+
+        if (!AddMovementInputFn || !Pawn)
+            return;
+
+        struct
+        {
+            FVector WorldDirection;
+            float ScaleValue;
+            bool bForce;
+        } Params{ Direction, Scale, false };
+
+        Pawn->ProcessEvent(AddMovementInputFn, &Params);
+    }
+
+    void SetLookRotation(const FRotator& Rotation)
+    {
+        static auto SetControlRotationFn = FindObject<UFunction>(L"/Script/Engine.Controller.SetControlRotation");
+
+        if (!SetControlRotationFn || !Controller)
+            return;
+
+        struct
+        {
+            FRotator NewRotation;
+        } Params{ Rotation };
+
+        Controller->ProcessEvent(SetControlRotationFn, &Params);
+    }
+
+    void SetActorRotation(const FRotator& Rotation)
+    {
+        if (!Pawn)
+            return;
+
+        static auto K2_SetActorRotationFn = FindObject<UFunction>(L"/Script/Engine.Actor.K2_SetActorRotation");
+        if (K2_SetActorRotationFn)
+        {
+            struct
+            {
+                FRotator NewRotation;
+                bool bTeleportPhysics;
+                bool ReturnValue;
+            } Params{ Rotation, false, false };
+
+            Pawn->ProcessEvent(K2_SetActorRotationFn, &Params);
+        }
+    }
+
+    FRotator YawToward(const FVector& From, const FVector& To)
+    {
+        float Yaw = std::atan2(To.Y - From.Y, To.X - From.X) * (180.f / 3.14159265f);
+
+        FRotator Rotation;
+        Rotation.Pitch = 0;
+        Rotation.Yaw = Yaw;
+        Rotation.Roll = 0;
+        return Rotation;
+    }
+
+    FVector FlatDirection(const FVector& From, const FVector& To)
+    {
+        FVector Direction;
+        Direction.X = To.X - From.X;
+        Direction.Y = To.Y - From.Y;
+        Direction.Z = 0;
+
+        float Length = std::sqrt(Direction.X * Direction.X + Direction.Y * Direction.Y);
+
+        if (Length < 1.f)
+            return FVector();
+
+        Direction.X /= Length;
+        Direction.Y /= Length;
+        return Direction;
+    }
+
+    float FlatDistance(const FVector& A, const FVector& B)
+    {
+        float DX = A.X - B.X;
+        float DY = A.Y - B.Y;
+        return std::sqrt(DX * DX + DY * DY);
+    }
+
+    static bool TraceGround(UObject* WorldContext, const FVector& Start, float& OutGroundZ)
+    {
+        static auto LineTraceSingleFn = FindObject<UFunction>(L"/Script/Engine.KismetSystemLibrary.LineTraceSingle");
+        static auto KismetSystemLibrary = FindObject(L"/Script/Engine.Default__KismetSystemLibrary");
+        if (!LineTraceSingleFn || !KismetSystemLibrary || !WorldContext)
+            return false;
+
+        static auto ReturnValueOffset = FindOffsetStruct("/Script/Engine.KismetSystemLibrary.LineTraceSingle", "ReturnValue");
+        static auto OutHitOffset = FindOffsetStruct("/Script/Engine.KismetSystemLibrary.LineTraceSingle", "OutHit");
+        static auto bIgnoreSelfOffset = FindOffsetStruct("/Script/Engine.KismetSystemLibrary.LineTraceSingle", "bIgnoreSelf");
+        static auto ParamsSize = LineTraceSingleFn->GetPropertiesSize();
+
+        void* Params = _alloca(ParamsSize);
+        memset(Params, 0, ParamsSize);
+
+        struct UKismetSystemLibrary_LineTraceSingle_Params
+        {
+            UObject* WorldContextObject;
+            FVector Start;
+            FVector End;
+            uint8_t TraceChannel;
+            bool bTraceComplex;
+            TArray<AActor*> ActorsToIgnore;
+            uint8_t DrawDebugType;
+            FHitResult OutHit;
+            bool bIgnoreSelf;
+            float TraceColor[4];
+            float TraceHitColor[4];
+            float DrawTime;
+            bool ReturnValue;
+        };
+
+        auto P = (UKismetSystemLibrary_LineTraceSingle_Params*)Params;
+        P->WorldContextObject = WorldContext;
+        P->Start = Start;
+        P->End = FVector(Start.X, Start.Y, -2000.f);
+        P->TraceChannel = 0;
+        P->bTraceComplex = false;
+        *(bool*)(__int64(Params) + bIgnoreSelfOffset) = true;
+
+        KismetSystemLibrary->ProcessEvent(LineTraceSingleFn, Params);
+
+        bool bHit = *(bool*)(__int64(Params) + ReturnValueOffset);
+        if (bHit)
+        {
+            auto HitResult = (FHitResult*)(__int64(Params) + OutHitOffset);
+            if (HitResult && HitResult->IsBlockingHit())
+            {
+                OutGroundZ = HitResult->GetLocation().Z;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void PickNewTarget(const FVector& Origin, float MinRadius, float MaxRadius)
+    {
+        float Angle = RandRange(0.f, 6.2831853f);
+        float Radius = RandRange(MinRadius, MaxRadius);
+
+        TargetLocation = Origin;
+        TargetLocation.X += std::cos(Angle) * Radius;
+        TargetLocation.Y += std::sin(Angle) * Radius;
+
+        if (TargetLocation.X < -65000.f) TargetLocation.X = -65000.f;
+        if (TargetLocation.X > 65000.f) TargetLocation.X = 65000.f;
+        if (TargetLocation.Y < -65000.f) TargetLocation.Y = -65000.f;
+        if (TargetLocation.Y > 65000.f) TargetLocation.Y = 65000.f;
+    }
+
+    void SetIsParachuteOpen(bool bOpen)
+    {
+        if (!Pawn || Pawn->IsActorBeingDestroyed())
+            return;
+
+        static auto Offset = Pawn->GetOffset("bIsParachuteOpen", false);
+        if (Offset != -1)
+        {
+            static auto Prop = Pawn->GetProperty("bIsParachuteOpen", false);
+            if (Prop)
+                Pawn->SetBitfieldValue(Offset, GetFieldMask(Prop), bOpen);
+            else
+                Pawn->Get<bool>(Offset) = bOpen;
+        }
+
+        // Don't call OnRep_IsParachuteOpen by hand. That function is a network
+        // OnRep: the engine runs it on a client when the property replicates,
+        // and on a pawn we spawned by hand it dereferences state that only the
+        // normal replication path sets up. Calling it here raised
+        // EXCEPTION_ACCESS_VIOLATION reading 0x0, which killed the server.
+        // The anim blueprint reads bIsParachuteOpen directly, so setting the
+        // property above is all the bots need.
+    }
+
+    void SetIsSkydiving(bool bSkydiving)
+    {
+        if (!Pawn || Pawn->IsActorBeingDestroyed())
+            return;
+
+        static auto Offset = Pawn->GetOffset("bIsSkydiving", false);
+        if (Offset != -1)
+        {
+            static auto Prop = Pawn->GetProperty("bIsSkydiving", false);
+            if (Prop)
+                Pawn->SetBitfieldValue(Offset, GetFieldMask(Prop), bSkydiving);
+            else
+                Pawn->Get<bool>(Offset) = bSkydiving;
+        }
+
+        // Same reason as SetIsParachuteOpen: the OnRep is a client-side
+        // notification and must not be invoked manually on the server.
+    }
+
+    bool GetAircraftLocation(FVector& OutLocation)
+    {
+        auto GameState = Cast<AFortGameStateAthena>(GetWorld()->GetGameState());
+
+        if (!GameState)
+            return false;
+
+        AActor* Aircraft = nullptr;
+
+        // In Season 4+ (including Season 8 v8.51), Aircrafts is a TArray<AActor*> of battle buses
+        static auto AircraftsOffset = GameState->GetOffset("Aircrafts", false);
+        if (AircraftsOffset != -1)
+        {
+            auto Aircrafts = GameState->GetPtr<TArray<AActor*>>(AircraftsOffset);
+            if (Aircrafts && Aircrafts->Num() > 0)
+                Aircraft = Aircrafts->at(0);
+        }
+
+        // Fallback for Season 1-3
+        if (!Aircraft)
+        {
+            static auto AircraftOffset = GameState->GetOffset("Aircraft", false);
+            if (AircraftOffset != -1)
+                Aircraft = GameState->Get<AActor*>(AircraftOffset);
+        }
+
+        // Fallback: Find all FortAthenaAircraft actors in the world
+        if (!Aircraft)
+        {
+            static auto FortAthenaAircraftClass = FindObject<UClass>(L"/Script/FortniteGame.FortAthenaAircraft");
+            if (FortAthenaAircraftClass)
+            {
+                auto AllAircrafts = UGameplayStatics::GetAllActorsOfClass(GetWorld(), FortAthenaAircraftClass);
+                if (AllAircrafts.Num() > 0)
+                    Aircraft = AllAircrafts.at(0);
+                AllAircrafts.Free();
+            }
+        }
+
+        if (!Aircraft || !Aircraft->IsValidLowLevel())
+            return false;
+
+        OutLocation = Aircraft->GetActorLocation();
+        return true;
+    }
+
+    void DoJumpFromBus()
+    {
+        auto AthenaController = Cast<AFortPlayerControllerAthena>(Controller);
+
+        if (!AthenaController)
+            return;
+
+        AFortPlayerController::ServerAttemptAircraftJumpHook(AthenaController, FRotator());
+    }
+
+    void RefreshPawn()
+    {
+        if (!Controller)
+        {
+            Pawn = nullptr;
+            return;
+        }
+
+        Pawn = Cast<AFortPlayerPawnAthena>(Controller->GetPawn());
+    }
+
+    bool HasLivePawn()
+    {
+        return Pawn && !Pawn->IsActorBeingDestroyed();
+    }
+
+    void WalkToward(const FVector& Target, float Scale)
+    {
+        FVector Location = Pawn->GetActorLocation();
+        FVector Direction = FlatDirection(Location, Target);
+
+        if (Direction.X == 0 && Direction.Y == 0)
+            return;
+
+        FRotator TargetRotation = YawToward(Location, Target);
+        SetLookRotation(TargetRotation);
+        SetActorRotation(TargetRotation);
+        AddMovement(Direction, Scale);
+    }
+
+    bool PlaceAtAircraft()
+    {
+        FVector AircraftLocation;
+        bool bHasAircraft = GetAircraftLocation(AircraftLocation);
+
+        if (!bHasAircraft)
+        {
+            AircraftLocation = FVector(RandRange(-20000.f, 20000.f), RandRange(-20000.f, 20000.f), 12000.f);
+        }
+        else
+        {
+            AircraftLocation.X += RandRange(-400.f, 400.f);
+            AircraftLocation.Y += RandRange(-400.f, 400.f);
+            AircraftLocation.Z -= 250.f;
+        }
+
+        if (Pawn && !Pawn->IsActorBeingDestroyed())
+        {
+            Pawn->K2_DestroyActor();
+            Pawn = nullptr;
+        }
+
+        FTransform SpawnTransform{};
+        SpawnTransform.Translation = AircraftLocation;
+        SpawnTransform.Rotation.W = 1.0f; // Critical: valid identity quaternion!
+        SpawnTransform.Scale3D = FVector(1, 1, 1);
+
+        Pawn = GetWorld()->SpawnActor<AFortPlayerPawnAthena>(PawnClass, SpawnTransform, CreateSpawnParameters(ESpawnActorCollisionHandlingMethod::AlwaysSpawn));
+
+        if (!Pawn)
+        {
+            Pawn = GetWorld()->SpawnActor<AFortPlayerPawnAthena>(PawnClass, SpawnTransform, CreateSpawnParameters(ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn));
+        }
+
+        if (!Pawn)
+        {
+            LOG_ERROR(LogBots, "Failed to spawn pawn at aircraft for bot {}!", PlayerState ? PlayerState->GetPlayerName().ToString() : "Unknown");
+            return false;
+        }
+
+        Controller->Possess(Pawn);
+        Pawn->SetMaxHealth(100);
+        Pawn->SetHealth(100);
+        ApplyCosmeticLoadout();
+        SetupInventory();
+
+        // SetupInventory destroys the pawn and the controller when it cannot
+        // create the world inventory. Carrying on with dead actors from here is
+        // how this function ended up faulting on a null pointer.
+        if (!HasLivePawn() || !Controller || Controller->IsActorBeingDestroyed())
+        {
+            LOG_ERROR(LogBots, "Bot {} lost its pawn while equipping it at the bus.",
+                PlayerState ? PlayerState->GetPlayerName().ToString() : "Unknown");
+            Pawn = nullptr;
+            return false;
+        }
+
+        if (PlayerState)
+        {
+            static auto PS_bInAircraftOffset = PlayerState->GetOffset("bInAircraft", false);
+            if (PS_bInAircraftOffset != -1)
+            {
+                static auto PS_bInAircraftProp = PlayerState->GetProperty("bInAircraft", false);
+                if (PS_bInAircraftProp)
+                    PlayerState->SetBitfieldValue(PS_bInAircraftOffset, GetFieldMask(PS_bInAircraftProp), false);
+            }
+
+            static auto bHasEverSkydivedFromBusOffset = PlayerState->GetOffset("bHasEverSkydivedFromBus", false);
+            if (bHasEverSkydivedFromBusOffset != -1)
+                PlayerState->Get<bool>(bHasEverSkydivedFromBusOffset) = true;
+        }
+
+        if (Controller)
+        {
+            static auto PC_bInAircraftOffset = Controller->GetOffset("bInAircraft", false);
+            if (PC_bInAircraftOffset != -1)
+            {
+                static auto PC_bInAircraftProp = Controller->GetProperty("bInAircraft", false);
+                if (PC_bInAircraftProp)
+                    Controller->SetBitfieldValue(PC_bInAircraftOffset, GetFieldMask(PC_bInAircraftProp), false);
+            }
+        }
+
+        SetIsSkydiving(true);
+        SetIsParachuteOpen(false);
+
+        LOG_INFO(LogBots, "Bot pawn created at the bus: {}", PlayerState ? PlayerState->GetPlayerName().ToString() : "Unknown");
+        return true;
+    }
+
+    void BeginFreefall(float CurrentTime)
+    {
+        SetInvulnerable(true);
+        GliderTime = CurrentTime + RandRange(10.f, 18.f);
+        bGliderRequested = false;
+        bDamageRestored = false;
+        LastUpdateTime = CurrentTime;
+
+        if (Pawn)
+        {
+            PickNewTarget(Pawn->GetActorLocation(), 4000.f, 25000.f);
+
+            float GroundZ = 1500.f;
+            if (TraceGround(GetWorld(), FVector(TargetLocation.X, TargetLocation.Y, 20000.f), GroundZ))
+            {
+                EstimatedGroundZ = GroundZ;
+            }
+            else
+            {
+                EstimatedGroundZ = 1500.f;
+            }
+        }
+
+        State = EBotState::Freefall;
+    }
+
+    bool IsBusPhase()
+    {
+        auto GameState = Cast<AFortGameStateAthena>(GetWorld()->GetGameState());
+
+        if (!GameState)
+            return false;
+
+        return GameState->GetGamePhase() == EAthenaGamePhase::Aircraft;
+    }
+
+    bool IsAfterBusPhase()
+    {
+        auto GameState = Cast<AFortGameStateAthena>(GetWorld()->GetGameState());
+
+        if (!GameState)
+            return false;
+
+        return (int)GameState->GetGamePhase() > (int)EAthenaGamePhase::Aircraft;
+    }
+
+    void UpdateWaiting(float CurrentTime)
+    {
+        if (IsBusPhase() || IsAfterBusPhase() || (PlayerState && PlayerState->IsInAircraft()))
+        {
+            if (Pawn && !Pawn->IsActorBeingDestroyed())
+            {
+                Pawn->K2_DestroyActor();
+                Pawn = nullptr;
+            }
+
+            if (PlayerState)
+            {
+                static auto PS_bInAircraftOffset = PlayerState->GetOffset("bInAircraft", false);
+                if (PS_bInAircraftOffset != -1)
+                {
+                    static auto PS_bInAircraftProp = PlayerState->GetProperty("bInAircraft", false);
+                    if (PS_bInAircraftProp)
+                        PlayerState->SetBitfieldValue(PS_bInAircraftOffset, GetFieldMask(PS_bInAircraftProp), true);
+                }
+            }
+
+            if (Controller)
+            {
+                static auto PC_bInAircraftOffset = Controller->GetOffset("bInAircraft", false);
+                if (PC_bInAircraftOffset != -1)
+                {
+                    static auto PC_bInAircraftProp = Controller->GetProperty("bInAircraft", false);
+                    if (PC_bInAircraftProp)
+                        Controller->SetBitfieldValue(PC_bInAircraftOffset, GetFieldMask(PC_bInAircraftProp), true);
+                }
+            }
+
+            // Wait until aircraft enters drop zone before scheduling jump
+            JumpFromBusTime = 0.f;
+
+            bShouldThankBusDriver = (std::rand() % 100) < 55;
+            bThankedBusDriver = false;
+            ThankBusDriverTime = CurrentTime + RandRange(2.f, 8.f);
+
+            State = EBotState::Bus;
+        }
+    }
+
+    void UpdateBus(float CurrentTime)
+    {
+        TryThankBusDriver(CurrentTime);
+
+        // Don't jump until aircraft has entered the drop zone, unless bus flight is over
+        if (!bAircraftEnteredDropZone && !IsAfterBusPhase())
+            return;
+
+        if (JumpFromBusTime <= 0.f)
+        {
+            JumpFromBusTime = CurrentTime + RandRange(1.0f, 25.0f);
+        }
+
+        if (IsAfterBusPhase())
+        {
+            JumpFromBusTime = CurrentTime;
+        }
+
+        if (CurrentTime < JumpFromBusTime)
+            return;
+
+        DoJumpFromBus();
+        RefreshPawn();
+
+        if (!Pawn)
+        {
+            if (!PlaceAtAircraft())
+            {
+                JumpFromBusTime = CurrentTime + 1.f;
+                return;
+            }
+        }
+        else
+        {
+            ApplyCosmeticLoadout();
+            SetupInventory();
+            SetInvulnerable(true);
+        }
+
+        BeginFreefall(CurrentTime);
+    }
+
+    void UpdateFreefall(float CurrentTime)
+    {
+        SetInvulnerable(true);
+
+        if (!Pawn)
+        {
+            RefreshPawn();
+            if (!Pawn)
+                return;
+        }
+
+        float DeltaTime = CurrentTime - LastUpdateTime;
+        if (DeltaTime < 0.03f)
+            return;
+        LastUpdateTime = CurrentTime;
+        if (DeltaTime > 0.15f)
+            DeltaTime = 0.033f;
+
+        FVector Loc = Pawn->GetActorLocation();
+
+        // Skydiving descent speed ~4000 cm/s, horizontal glide ~1600 cm/s
+        float FallSpeed = 4000.f;
+        float HorizSpeed = 1600.f;
+        FVector Dir = FlatDirection(Loc, TargetLocation);
+
+        FVector Step = FVector(Dir.X * HorizSpeed * DeltaTime, Dir.Y * HorizSpeed * DeltaTime, -FallSpeed * DeltaTime);
+        FVector NewLoc = Loc + Step;
+
+        FRotator NewRot = YawToward(Loc, TargetLocation);
+        NewRot.Pitch = -35.f;
+
+        auto Movement = GetMovementComponent();
+        if (Movement)
+        {
+            static auto VelocityOffset = Movement->GetOffset("Velocity", false);
+            if (VelocityOffset != -1)
+            {
+                Movement->Get<FVector>(VelocityOffset) = FVector(Dir.X * HorizSpeed, Dir.Y * HorizSpeed, -FallSpeed);
+            }
+        }
+
+        Pawn->TeleportTo(NewLoc, NewRot);
+        SetLookRotation(NewRot);
+
+        // Check ground distance or time to open glider
+        if (CurrentTime >= GliderTime || (NewLoc.Z - EstimatedGroundZ) <= 2200.f || NewLoc.Z <= 3200.f)
+        {
+            SetIsParachuteOpen(true);
+            SetIsSkydiving(false);
+            State = EBotState::Gliding;
+        }
+    }
+
+    void UpdateGliding(float CurrentTime)
+    {
+        SetInvulnerable(true);
+
+        if (!Pawn)
+        {
+            RefreshPawn();
+            if (!Pawn)
+                return;
+        }
+
+        float DeltaTime = CurrentTime - LastUpdateTime;
+        if (DeltaTime < 0.03f)
+            return;
+        LastUpdateTime = CurrentTime;
+        if (DeltaTime > 0.15f)
+            DeltaTime = 0.033f;
+
+        FVector Loc = Pawn->GetActorLocation();
+
+        // Gliding descent speed ~900 cm/s, forward glide ~1250 cm/s
+        float GlideFallSpeed = 900.f;
+        float GlideHorizSpeed = 1250.f;
+        FVector Dir = FlatDirection(Loc, TargetLocation);
+
+        FVector Step = FVector(Dir.X * GlideHorizSpeed * DeltaTime, Dir.Y * GlideHorizSpeed * DeltaTime, -GlideFallSpeed * DeltaTime);
+        FVector NewLoc = Loc + Step;
+
+        FRotator NewRot = YawToward(Loc, TargetLocation);
+        NewRot.Pitch = -5.f;
+
+        auto Movement = GetMovementComponent();
+        if (Movement)
+        {
+            static auto VelocityOffset = Movement->GetOffset("Velocity", false);
+            if (VelocityOffset != -1)
+            {
+                Movement->Get<FVector>(VelocityOffset) = FVector(Dir.X * GlideHorizSpeed, Dir.Y * GlideHorizSpeed, -GlideFallSpeed);
+            }
+        }
+
+        // Land check!
+        if (NewLoc.Z <= EstimatedGroundZ + 30.f || NewLoc.Z <= 450.f)
+        {
+            NewLoc.Z = (EstimatedGroundZ > 200.f ? EstimatedGroundZ : 1000.f) + 15.f;
+            NewRot.Pitch = 0.f;
+            Pawn->TeleportTo(NewLoc, NewRot);
+
+            SetIsParachuteOpen(false);
+            SetIsSkydiving(false);
+
+            SetMovementMode(1); // Walking
+
+            auto Movement = GetMovementComponent();
+            if (Movement)
+            {
+                static auto VelocityOffset = Movement->GetOffset("Velocity", false);
+                if (VelocityOffset != -1)
+                {
+                    Movement->Get<FVector>(VelocityOffset) = FVector(0, 0, 0);
+                }
+
+                static auto bOrientRotationToMovementOffset = Movement->GetOffset("bOrientRotationToMovement", false);
+                if (bOrientRotationToMovementOffset != -1)
+                {
+                    static auto bOrientProp = Movement->GetProperty("bOrientRotationToMovement", false);
+                    if (bOrientProp)
+                        Movement->SetBitfieldValue(bOrientRotationToMovementOffset, GetFieldMask(bOrientProp), true);
+                    else
+                        Movement->Get<bool>(bOrientRotationToMovementOffset) = true;
+                }
+            }
+
+            LandedTime = CurrentTime;
+            bDamageRestored = false;
+            LastPosition = NewLoc;
+            NextStuckCheckTime = CurrentTime + 2.f;
+            NextMoveTargetTime = CurrentTime + 1.f;
+            PickNewTarget(NewLoc, 1500.f, 6000.f);
+
+            State = EBotState::Roaming;
+            LOG_INFO(LogBots, "Bot {} landed on the island at ({}, {}, {})",
+                PlayerState ? PlayerState->GetPlayerName().ToString() : "Unknown",
+                (int)NewLoc.X, (int)NewLoc.Y, (int)NewLoc.Z);
+            return;
+        }
+
+        Pawn->TeleportTo(NewLoc, NewRot);
+        SetLookRotation(NewRot);
+    }
+
+    void UpdateRoaming(float CurrentTime)
+    {
+        if (!Pawn)
+            return;
+
+        float DeltaTime = CurrentTime - LastUpdateTime;
+        if (DeltaTime < 0.03f)
+            return;
+        LastUpdateTime = CurrentTime;
+
+        if (!bDamageRestored)
+        {
+            if (CurrentTime >= LandedTime + 2.f)
+            {
+                Pawn->SetCanBeDamaged(true);
+                bDamageRestored = true;
+            }
+            else
+            {
+                Pawn->SetHealth(100);
+            }
+        }
+
+        FVector Location = Pawn->GetActorLocation();
+
+        if (CurrentTime >= NextMoveTargetTime || FlatDistance(Location, TargetLocation) < 250.f)
+        {
+            PickNewTarget(Location, 1500.f, 6000.f);
+            NextMoveTargetTime = CurrentTime + RandRange(8.f, 20.f);
+        }
+
+        WalkToward(TargetLocation, 0.5f + RandRange(0.f, 0.2f));
+
+        static auto JumpFn = FindObject<UFunction>(L"/Script/Engine.Character.Jump");
+
+        if (CurrentTime >= NextStuckCheckTime)
+        {
+            if (FlatDistance(Location, LastPosition) < 60.f)
+            {
+                if (JumpFn)
+                    Pawn->ProcessEvent(JumpFn);
+
+                PickNewTarget(Location, 1500.f, 6000.f);
+                NextMoveTargetTime = CurrentTime + RandRange(8.f, 20.f);
+            }
+
+            LastPosition = Location;
+            NextStuckCheckTime = CurrentTime + RandRange(1.5f, 2.5f);
+        }
+
+        if (CurrentTime >= NextJumpTime)
+        {
+            if (JumpFn)
+                Pawn->ProcessEvent(JumpFn);
+
+            NextJumpTime = CurrentTime + RandRange(5.f, 14.f);
+        }
+    }
+
+    void Update()
+    {
+        if (!Controller || Controller->IsActorBeingDestroyed())
+            return;
+
+        PlayerState = Cast<AFortPlayerStateAthena>(Controller->GetPlayerState());
+
+        if (!PlayerState)
+            return;
+
+        RefreshPawn();
+
+        float CurrentTime = Now();
+
+        if (CurrentTime >= NextLogTime)
+        {
+            NextLogTime = CurrentTime + 5.f;
+            LOG_INFO(LogBots, "Bot state={} pawn={} aircraft={} busphase={} mode={}", (int)State, HasLivePawn(), PlayerState->IsInAircraft(), IsBusPhase(), GetMovementMode());
+        }
+
+        switch (State)
+        {
+        case EBotState::Waiting:
+            UpdateWaiting(CurrentTime);
+            return;
+        case EBotState::Bus:
+            UpdateBus(CurrentTime);
+            return;
+        default:
+            break;
+        }
+
+        if (!HasLivePawn())
+            return;
+
+        switch (State)
+        {
+        case EBotState::Freefall:
+            UpdateFreefall(CurrentTime);
+            break;
+        case EBotState::Gliding:
+            UpdateGliding(CurrentTime);
+            break;
+        case EBotState::Roaming:
+            UpdateRoaming(CurrentTime);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void Initialize(const FTransform& SpawnTransform, AActor* InSpawnLocator)
+    {
+        auto GameState = Cast<AFortGameStateAthena>(GetWorld()->GetGameState());
+        auto GameMode = Cast<AFortGameModeAthena>(GetWorld()->GetGameMode());
+
+        if (!IsReadyToSpawnBot())
+        {
+            LOG_ERROR(LogBots, "We are not prepared to spawn a bot!");
+            return;
+        }
+
+        FTransform BotSpawnTransform = SpawnTransform;
+        BotSpawnTransform.Translation.X += RandRange(-250.f, 250.f);
+        BotSpawnTransform.Translation.Y += RandRange(-250.f, 250.f);
+
+        Controller = GetWorld()->SpawnActor<AController>(ControllerClass);
+        Pawn = GetWorld()->SpawnActor<AFortPlayerPawnAthena>(PawnClass, BotSpawnTransform, CreateSpawnParameters(ESpawnActorCollisionHandlingMethod::AlwaysSpawn));
+
+        if (Controller)
+            PlayerState = Cast<AFortPlayerStateAthena>(Controller->GetPlayerState());
+
+        if (!Controller || !Pawn || !PlayerState)
+        {
+            LOG_ERROR(LogBots, "Failed to spawn controller, pawn or playerstate!");
+            Controller = nullptr;
+            return;
+        }
+
+        bIsAthenaController = Cast<AFortPlayerControllerAthena>(Controller) != nullptr;
+
+        PlayerState->SetIsBot(true);
+
+        static int BotPlayerIdCounter = 1000;
+        PlayerState->GetPlayerID() = ++BotPlayerIdCounter;
+
+        if (Controller->GetPawn() != Pawn)
+        {
+            Controller->Possess(Pawn);
+        }
+
+        FString BotNewName = GetRandomName();
+        LOG_INFO(LogBots, "BotNewName: {}", BotNewName.ToString());
+        SetName(BotNewName);
+
+        PlayerState->GetTeamIndex() = GameMode->Athena_PickTeamHook(GameMode, 0, Controller);
+
+        static auto SquadIdOffset = PlayerState->GetOffset("SquadId", false);
+
+        if (SquadIdOffset != -1)
+            PlayerState->GetSquadId() = PlayerState->GetTeamIndex() - NumToSubtractFromSquadId;
+
+        GameState->AddPlayerStateToGameMemberInfo(PlayerState);
+
+        Pawn->SetHealth(100);
+        Pawn->SetMaxHealth(100);
+
+        auto PlayerAbilitySet = GetPlayerAbilitySet();
+        auto AbilitySystemComponent = PlayerState->GetAbilitySystemComponent();
+
+        if (PlayerAbilitySet && AbilitySystemComponent)
+        {
+            PlayerAbilitySet->GiveToAbilitySystem(AbilitySystemComponent);
+        }
+
+        SetupInventory();
+        PickRandomLoadout();
+        ApplyCosmeticLoadout();
+
+        static auto bHasServerFinishedLoadingOffset = Controller->GetOffset("bHasServerFinishedLoading", false);
+        if (bHasServerFinishedLoadingOffset != -1)
+        {
+            Controller->Get<bool>(bHasServerFinishedLoadingOffset) = true;
+            static auto OnRep_bHasServerFinishedLoadingFn = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.OnRep_bHasServerFinishedLoading");
+            if (OnRep_bHasServerFinishedLoadingFn)
+                Controller->ProcessEvent(OnRep_bHasServerFinishedLoadingFn);
+        }
+
+        static auto bHasClientFinishedLoadingOffset = Controller->GetOffset("bHasClientFinishedLoading", false);
+        if (bHasClientFinishedLoadingOffset != -1)
+        {
+            Controller->Get<bool>(bHasClientFinishedLoadingOffset) = true;
+        }
+
+        if (PlayerState)
+        {
+            static auto bHasStartedPlayingOffset = PlayerState->GetOffset("bHasStartedPlaying", false);
+            if (bHasStartedPlayingOffset != -1)
+            {
+                static auto bHasStartedPlayingProp = PlayerState->GetProperty("bHasStartedPlaying", false);
+                if (bHasStartedPlayingProp)
+                    PlayerState->SetBitfieldValue(bHasStartedPlayingOffset, GetFieldMask(bHasStartedPlayingProp), true);
+                else
+                    PlayerState->Get<bool>(bHasStartedPlayingOffset) = true;
+
+                static auto OnRep_bHasStartedPlayingFn = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerState.OnRep_bHasStartedPlaying");
+                if (OnRep_bHasStartedPlayingFn)
+                    PlayerState->ProcessEvent(OnRep_bHasStartedPlayingFn);
+            }
+        }
+
+        static auto ServerReadyToStartMatchFn = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerReadyToStartMatch");
+        if (ServerReadyToStartMatchFn)
+        {
+            Controller->ProcessEvent(ServerReadyToStartMatchFn, nullptr);
+        }
+
+        static auto ServerLoadingScreenDroppedFn = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerLoadingScreenDropped");
+        if (ServerLoadingScreenDroppedFn)
+        {
+            Controller->ProcessEvent(ServerLoadingScreenDroppedFn, nullptr);
+        }
+
+        ++GameState->GetPlayersLeft();
+        GameState->OnRep_PlayersLeft();
+
+        if (auto FortPlayerControllerAthena = Cast<AFortPlayerControllerAthena>(Controller))
+        {
+            GameMode->GetAlivePlayers().Add(FortPlayerControllerAthena);
+        }
+
+        NextJumpTime = Now() + RandRange(5.f, 14.f);
+        State = EBotState::Waiting;
+    }
+};
+
+namespace Bots
+{
+    // No `static` here on purpose: at namespace scope it would give the vector
+    // internal linkage, so FortGameModeAthena.cpp (which fills the queue) and
+    // NetDriver.cpp (whose Tick drains it) would each get their own empty copy
+    // and no bot would ever spawn. It must stay a single shared inline variable.
+    inline std::vector<AActor*> PendingBotPlayerStarts;
+    // 5 per tick is the pacing the previous working build used: a bot costs
+    // ~30ms to create (controller, pawn, inventory), so 5 stays well under the
+    // client's replication timeout while still spawning 99 bots in ~1 second.
+    static constexpr int MaxBotSpawnsPerTick = 5;
+
+    static AController* SpawnBot(FTransform SpawnTransform, AActor* InSpawnLocator)
+    {
+        auto playerBot = new PlayerBot();
+        playerBot->Initialize(SpawnTransform, InSpawnLocator);
+
+        if (!playerBot->Controller)
+        {
+            delete playerBot;
+            return nullptr;
+        }
+
+        AllPlayerBotsToTick.push_back(playerBot);
+        return playerBot->Controller;
+    }
+
+    static void SpawnBotsAtPlayerStarts(int AmountOfBots)
+    {
+        if (!PlayerBot::IsReadyToSpawnBot())
+        {
+            PlayerBot::InitializeBotClasses();
+        }
+
+        PlayerBot::ProbeAircraftFields(); 
+
+        bAircraftEnteredDropZone = false;
+        AircraftDropZoneEnterTime = 0.f;
+
+        static auto FortPlayerStartCreativeClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
+        static auto FortPlayerStartWarmupClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartWarmup");
+        static auto FortPlayerStartClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStart");
+        TArray<AActor*> PlayerStarts = UGameplayStatics::GetAllActorsOfClass(GetWorld(), Globals::bCreative ? FortPlayerStartCreativeClass : FortPlayerStartWarmupClass);
+
+        if (PlayerStarts.Num() == 0 && FortPlayerStartClass)
+        {
+            PlayerStarts.Free();
+            PlayerStarts = UGameplayStatics::GetAllActorsOfClass(GetWorld(), FortPlayerStartClass);
+        }
+
+        int ActorsNum = PlayerStarts.Num();
+
+        if (ActorsNum == 0)
+        {
+            LOG_WARN(LogBots, "No PlayerStarts found to spawn bots!");
+            return;
+        }
+
+        LOG_INFO(LogBots, "Spawning all {} bots across {} player starts...", AmountOfBots, ActorsNum);
+
+        // Creating a bot spawns a controller, a pawn and a whole inventory. Doing
+        // all of them in one frame froze the game thread for ~3 seconds, which
+        // made the client time out ("no server replication in 2.00 seconds") right
+        // as it was initializing the world. Queue them and let Tick spread the
+        // work over a few frames instead.
+        PendingBotPlayerStarts.clear();
+
+        for (int i = 0; i < AmountOfBots; ++i)
+        {
+            AActor* PlayerStart = PlayerStarts.at(std::rand() % ActorsNum);
+            if (!PlayerStart)
+                continue;
+
+            PendingBotPlayerStarts.push_back(PlayerStart);
+        }
+
+        PlayerStarts.Free();
+    }
+
+    static void SpawnQueuedBots()
+    {
+        for (int i = 0; i < MaxBotSpawnsPerTick && !PendingBotPlayerStarts.empty(); ++i)
+        {
+            AActor* PlayerStart = PendingBotPlayerStarts.back();
+            PendingBotPlayerStarts.pop_back();
+
+            if (!PlayerStart || !PlayerStart->IsValidLowLevel())
+                continue;
+
+            auto NewBot = SpawnBot(PlayerStart->GetTransform(), PlayerStart);
+
+            if (NewBot)
+                NewBot->SetCanBeDamaged(Fortnite_Version < 7);
+        }
+
+        if (PendingBotPlayerStarts.empty())
+            LOG_INFO(LogBots, "All {} bots spawned successfully!", AllPlayerBotsToTick.size());
+    }
+
+    // A fault on one bot must not take the whole host down: the access
+    // violation in PlayerBot::Update() killed the server, after which no client
+    // received replication and movement input was blocked. Each bot now runs
+    // behind a structured-exception guard and a faulting bot is dropped.
+    static bool UpdateBotSafely(PlayerBot* Bot)
+    {
+        __try
+        {
+            Bot->Update();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    static void Tick()
+    {
+        
+        static bool bAircraftStarted = false;
+        if (bStartedBus && !bAircraftStarted)
+        {
+            auto World = GetWorld();
+            if (World)
+            {
+                auto GameMode = Cast<AFortGameModeAthena>(World->GetGameMode());
+                if (GameMode)
+                {
+                    auto GameState = Cast<AFortGameStateAthena>(GameMode->GetGameState());
+                    if (GameState && GameState->GetGamePhase() == EAthenaGamePhase::Warmup)
+                    {
+                        static auto WarmupCountdownEndTimeOffset = GameState->GetOffset("WarmupCountdownEndTime");
+                        float EndTime = GameState->Get<float>(WarmupCountdownEndTimeOffset);
+                        float CurrentTime = GameState->GetServerWorldTimeSeconds();
+
+                        if (EndTime > 0 && CurrentTime >= EndTime)
+                        {
+                            bAircraftStarted = true;
+                            LOG_INFO(LogDev, "Warmup countdown expired, starting Aircraft Phase!");
+                            GameMode->StartAircraftPhase();
+                        }
+                    }
+                    else if (GameState && GameState->GetGamePhase() == EAthenaGamePhase::Aircraft)
+                    {
+                        bAircraftStarted = true;
+                    }
+                }
+
+                auto GS = Cast<AFortGameStateAthena>(World->GetGameState());
+                float Now = GS ? GS->GetServerWorldTimeSeconds() : 0.f;
+                if (Now >= NextTickLogTime)
+                {
+                    NextTickLogTime = Now + 5.f;
+                    LOG_INFO(LogBots, "Bots::Tick alive, {} bots, phase={}", AllPlayerBotsToTick.size(), GS ? (int)GS->GetGamePhase() : -1);
+                }
+            }
+        }
+
+        if (!PendingBotPlayerStarts.empty())
+            SpawnQueuedBots();
+
+        if (AllPlayerBotsToTick.empty())
+            return;
+
+        for (size_t i = 0; i < AllPlayerBotsToTick.size();)
+        {
+            auto Bot = AllPlayerBotsToTick.at(i);
+
+            if (!Bot)
+            {
+                ++i;
+                continue;
+            }
+
+            if (!UpdateBotSafely(Bot))
+            {
+                LOG_ERROR(LogBots, "Bot {} faulted during its update and is dropped from the match.",
+                    Bot->PlayerState ? Bot->PlayerState->GetPlayerName().ToString() : "Unknown");
+                AllPlayerBotsToTick.erase(AllPlayerBotsToTick.begin() + i);
+                continue;
+            }
+
+            ++i;
+        }
+    }
+}
+
+namespace Bosses
+{
+
+}
